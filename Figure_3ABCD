@@ -1,0 +1,779 @@
+pkgs <- c(
+  "readxl","writexl","dplyr","tidyr",
+  "sf","terra","pastclim",
+  "MuMIn","ggplot2","patchwork"
+)
+to_install <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
+if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+options(na.action = "na.fail")
+
+pal_sign <- c(
+  Positive = "#D55E00",
+  Negative = "#0072B2"
+)
+
+pal_group <- c(
+  Climate     = "#59A14F",
+  Landuse     = "#E15759",
+  Sampling    = "#F28E2B",
+  Host        = "#4E79A7",
+  Unexplained = "grey75"
+)
+
+theme_pub <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(face = "bold")
+    )
+}
+
+out_dir <- "C:/Users/tanzh/OneDrive/桌面/R_study/Map/plots_alpha_3levels"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+virus_list <- read_excel("副本000-virus_20260310-ve_vs.xlsx")
+host_list  <- read_excel("副本host_virus-XL-Zone-BoundaryMatch_20260115.xlsx")
+
+richness_df <- virus_list %>%
+  group_by(Library) %>%
+  summarise(Viral_richness = n_distinct(Virus), .groups = "drop")
+
+analysis_df <- host_list %>%
+  left_join(richness_df, by = "Library") %>%
+  filter(!is.na(Viral_richness))
+
+
+files <- list.files("data/climate/wc2.1_10m/wc10",
+                    pattern = "\\.tif$", full.names = TRUE)
+bio <- rast(files)
+names(bio) <- paste0("BIO", 1:19)
+
+samples_sf <- st_as_sf(analysis_df, coords = c("lon","lat"), crs = 4326)
+bio_values <- terra::extract(bio, vect(samples_sf))
+host_with_bio <- cbind(analysis_df, bio_values[, -1])
+
+
+set_data_path("data/pastclim")
+vars_hyde <- get_vars_for_dataset("HYDE_3.3_baseline")
+
+buffers_100 <- samples_sf %>%
+  st_transform(3857) %>%
+  st_buffer(100000) %>%
+  st_transform(4326)
+
+var_means <- list()
+for (v in vars_hyde) {
+  r <- region_slice(
+    dataset = "HYDE_3.3_baseline",
+    bio_variables = v,
+    time_bp = 0,
+    time_ce = NULL
+  )
+  var_means[[v]] <- terra::extract(
+    r, vect(buffers_100),
+    fun = mean, na.rm = TRUE
+  )[, -1]
+}
+env_data <- as.data.frame(var_means)
+
+all_data <- cbind(host_with_bio, env_data)
+
+
+env_pca <- prcomp(all_data[, paste0("BIO", 1:19)], scale. = TRUE)
+all_data$CPC1 <- env_pca$x[,1]
+all_data$CPC2 <- env_pca$x[,2]
+all_data$CPC3 <- env_pca$x[,3]
+
+land_vars <- c(
+  "cropland","grazing_land","irrigated_rice","irrigated_not_rice",
+  "pasture","population_density","population",
+  "rainfed_not_rice","rainfed_rice","rangeland",
+  "rural_population","total_irrigated","total_rainfed",
+  "total_rice","urban_area","urban_population"
+)
+
+land_pca <- prcomp(all_data[, land_vars], scale. = TRUE)
+all_data$APC1 <- land_pca$x[,1]
+all_data$APC2 <- land_pca$x[,2]
+all_data$log_pop_density <- log1p(all_data$population_density)
+
+sampling_host_richness <- analysis_df %>%
+  group_by(zone, Province_County) %>%
+  summarise(
+    host_sampling_richness = n_distinct(Host_species),
+    .groups = "drop"
+  )
+
+all_data <- all_data %>%
+  left_join(sampling_host_richness,
+            by = c("zone","Province_County"))
+
+write_xlsx(
+  all_data,
+  file.path(out_dir, "host_with_all_eco_library_level_individual_vs_ve.xlsx")
+)
+all_data <- read_excel(
+  file.path(out_dir, "host_with_all_eco_library_level_individual_vs_ve.xlsx")
+)
+
+
+
+zones_all <- sort(unique(all_data$zone))
+
+var_groups <- list(
+  Host      = "Host_species",
+  Climate   = c("CPC1","CPC2","CPC3"),
+  Landuse   = c("APC1","APC2","log_pop_density"),
+  Sampling  = "host_sampling_richness"
+)
+
+best_effects_list <- list()
+varpart_list <- list()
+
+for (z in zones_all) {
+  
+  df_zone <- all_data %>% filter(zone == z)
+  
+  df_model <- df_zone %>%
+    dplyr::select(
+      Viral_richness, Host_species,
+      CPC1, CPC2, CPC3,
+      APC1, APC2, log_pop_density,
+      host_sampling_richness
+    ) %>%
+    na.omit()
+  
+  if (nrow(df_model) < 10) next
+  df_model$Host_species <- factor(df_model$Host_species)
+  
+  full_model <- glm(
+    Viral_richness ~ Host_species +
+      CPC1 + CPC2 + CPC3 +
+      APC1 + APC2 + log_pop_density +
+      host_sampling_richness,
+    family = poisson(),
+    data = df_model
+  )
+  
+  dred <- dredge(full_model, fixed = "Host_species")
+  best_model <- get.models(dred, 1)[[1]]
+  
+  coefs <- coef(best_model)
+  keep <- intersect(
+    names(coefs),
+    c("CPC1","CPC2","CPC3",
+      "APC1","APC2",
+      "log_pop_density",
+      "host_sampling_richness")
+  )
+  
+  if (length(keep) > 0) {
+    best_effects_list[[as.character(z)]] <- data.frame(
+      zone = z,
+      Variable = keep,
+      Estimate = coefs[keep]
+    )
+  }
+  
+  null_model <- glm(Viral_richness ~ 1,
+                    family = poisson(),
+                    data = df_model)
+  null_dev <- deviance(null_model)
+  full_dev <- deviance(best_model)
+  full_terms <- attr(terms(best_model), "term.labels")
+  
+  vp <- data.frame()
+  
+  for (g in names(var_groups)) {
+    
+    if (g == "Host") {
+      vars <- grep("^Host_species", full_terms, value = TRUE)
+    } else {
+      vars <- intersect(var_groups[[g]], full_terms)
+    }
+    
+    if (length(vars) == 0) {
+      vp <- rbind(vp,
+                  data.frame(zone = z,
+                             Group = g,
+                             explained_pct = 0))
+      next
+    }
+    
+    reduced_terms <- setdiff(full_terms, vars)
+    
+    f_red <- as.formula(
+      paste("Viral_richness ~",
+            ifelse(length(reduced_terms) == 0,
+                   "1",
+                   paste(reduced_terms, collapse = " + ")))
+    )
+    
+    red_model <- glm(f_red, family = poisson(), data = df_model)
+    
+    group_expl <- deviance(red_model) - full_dev
+    vp <- rbind(vp,
+                data.frame(zone = z,
+                           Group = g,
+                           explained_pct = 100 * group_expl / null_dev))
+  }
+  
+  vp <- rbind(vp,
+              data.frame(zone = z,
+                         Group = "Unexplained",
+                         explained_pct = max(0, 100 - sum(vp$explained_pct))))
+  varpart_list[[as.character(z)]] <- vp
+}
+
+
+bubble_df <- bind_rows(best_effects_list) %>%
+  mutate(
+    Sign   = ifelse(Estimate > 0, "Positive", "Negative"),
+    AbsEst = abs(Estimate),
+    Group = case_when(
+      Variable %in% c("CPC1","CPC2","CPC3") ~ "Climate",
+      Variable %in% c("APC1","APC2","log_pop_density") ~ "Landuse",
+      Variable %in% c("host_sampling_richness") ~ "Sampling"
+    )
+  )
+
+varpart_df <- bind_rows(varpart_list)
+
+zone_order_modeled <- varpart_df %>%
+  filter(Group != "Unexplained") %>%
+  group_by(zone) %>%
+  summarise(total_expl = sum(explained_pct), .groups = "drop") %>%
+  arrange(desc(total_expl)) %>%
+  pull(zone)
+
+zone_not_modeled <- setdiff(zones_all, zone_order_modeled)
+zone_order_final <- c(zone_order_modeled, zone_not_modeled)
+
+bubble_df$zone  <- factor(bubble_df$zone,  levels = zone_order_final)
+varpart_df$zone <- factor(varpart_df$zone, levels = zone_order_final)
+
+
+zones_in_pA <- unique(bubble_df$zone)
+zones_missing <- setdiff(zone_order_final, zones_in_pA)
+
+if (length(zones_missing) > 0) {
+  
+  message("Padding empty zones in pA: ",
+          paste(zones_missing, collapse = ", "))
+  
+  placeholder_df <- data.frame(
+    zone     = factor(zones_missing, levels = zone_order_final),
+    Variable = NA_character_,
+    Estimate = NA_real_,
+    Sign     = NA_character_,
+    AbsEst   = NA_real_,
+    Group    = NA_character_,
+    stringsAsFactors = FALSE
+  )
+  
+  bubble_df <- bind_rows(bubble_df, placeholder_df)
+  
+
+  bubble_df$zone <- factor(bubble_df$zone, levels = zone_order_final)
+}
+
+
+library(ggsci)
+
+
+
+pal_sign_pA <- c(
+  Positive = pal_jama()(7)[2],  
+  Negative = pal_jama()(7)[6]   
+)
+
+
+pal_group_npg <- c(
+  Host        = pal_npg("nrc")(10)[4],  
+  Climate     = pal_npg("nrc")(10)[3],  
+  Landuse     = pal_npg("nrc")(10)[2],  
+  Sampling    = pal_npg("nrc")(10)[6],  
+  Unexplained = "grey80"
+)
+
+## =========================================================
+## 7. Plot A (bubble)
+## =========================================================
+bubble_df_plot <- bubble_df %>%
+  filter(!is.na(Variable))
+
+pA <- ggplot(
+  bubble_df,
+  aes(x = Variable, y = zone,
+      size = AbsEst, fill = Sign)
+) +
+  geom_point(shape = 21, color = "black", na.rm = TRUE) +
+  scale_fill_manual(values = pal_sign_pA, na.translate = FALSE) +
+  scale_size(range = c(3, 10)) +
+  facet_grid(. ~ Group, scales = "free_x", space = "free_x") +
+  labs(
+    x = NULL,
+    y = "Zone",
+    size = "|Coefficient|",
+    fill = "Effect"
+  ) +
+  theme_pub() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+
+pA
+
+varpart_df <- varpart_df %>%
+  mutate(
+    Group = factor(
+      Group,
+      levels = c("Host", "Climate", "Landuse", "Sampling", "Unexplained")
+    )
+  )
+
+
+pB <- ggplot(
+  varpart_df,
+  aes(y = zone, x = explained_pct, fill = Group)
+) +
+  geom_col(
+    height = 0.7,
+    color = "black",
+    size = 0.2,
+    position = position_stack(reverse = TRUE)
+  ) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, by = 20),
+    labels = function(x) paste0(x, "%"),
+    expand = c(0, 0)
+  ) +
+  scale_fill_manual(values = pal_group_npg) +
+  labs(
+    x = "Deviance explained (%)",
+    y = "Zone",
+    fill = "Predictor group"
+  ) +
+  theme_pub()
+
+pB
+
+
+pAB <- pA | pB
+pAB
+ggsave(file.path(out_dir, "Individual_level_AB_FINAL.pdf"),
+       pAB, width = 14, height = 7)
+
+
+pal <- list(
+  pos = "#D55E00",     # Positive effect / highlight
+  neg = "#0072B2",     # Negative effect / highlight
+  gray = "gray40",
+  heat_low = "#c6dbef",
+  heat_high = "#08306b"
+)
+
+df_pop <- read_excel("population_level_data_ProvinceCounty_HostSpecies.xlsx")
+
+stopifnot(all(c("zone","Province_County","Host_species") %in% names(df_pop)))
+
+
+candidate_n <- c("n_individual","n_individuals","N_individual","N_individuals",
+                 "n","N","sample_size","n_libraries","n_library","Library_n","n_samples")
+n_col <- candidate_n[candidate_n %in% names(df_pop)][1]
+if (is.na(n_col)) {
+  stop("Population-level: 找不到种群个体数量列。请在 df_pop 中提供如 n_individuals / n_libraries 等列名。")
+}
+
+
+candidate_v <- c("Viral_richness","viral_richness","Viral_unique","viral_unique",
+                 "pop_viral_richness","population_viral_richness")
+v_col <- candidate_v[candidate_v %in% names(df_pop)][1]
+if (is.na(v_col)) {
+  stop("Population-level: 找不到种群病毒多样性列。请在 df_pop 中提供如 Viral_richness / Viral_unique 等列名。")
+}
+
+df_pop2 <- df_pop %>%
+  dplyr::select(zone, Province_County, Host_species,
+                n_pop = all_of(n_col),
+                viral_pop = all_of(v_col)) %>%
+  filter(!is.na(n_pop), n_pop > 0,
+         !is.na(viral_pop), viral_pop > 0)
+
+
+fit_pop <- glm(viral_pop ~ log(n_pop), family = poisson(), data = df_pop2)
+
+p_population <- ggplot(df_pop2, aes(x = n_pop, y = viral_pop)) +
+  geom_point(alpha = 0.7, size = 2.7) +
+  stat_smooth(method = "glm",
+              method.args = list(family = "poisson"),
+              se = TRUE,
+              color = pal$neg) +
+  scale_x_log10() +
+  labs(
+    title = "B. Population level: Viral richness vs population sample size",
+    x = "Population sample size (log10 scale)",
+    y = "Population viral richness"
+  ) +
+  theme_pub()
+p_population
+
+
+stopifnot(all(c("zone","Province_County","Host_species") %in% names(df_pop)))
+stopifnot("host_sampling_richness" %in% names(df_pop))
+
+
+if (!("Viral_unique" %in% names(df_pop))) {
+  stop("County-level: 需要 df_pop 中有 Viral_unique 列（用于统计县级病毒物种数）。")
+}
+
+df_pop_pos <- df_pop %>%
+  filter(!is.na(Viral_unique), Viral_unique != "")
+
+county_viral <- df_pop_pos %>%
+  group_by(zone, Province_County) %>%
+  summarise(county_viral_richness = n_distinct(Viral_unique), .groups = "drop")
+
+county_host <- df_pop_pos %>%
+  group_by(zone, Province_County) %>%
+  summarise(host_sampling_richness = first(host_sampling_richness), .groups = "drop")
+
+df_county <- left_join(county_viral, county_host, by = c("zone","Province_County")) %>%
+  filter(!is.na(host_sampling_richness), host_sampling_richness > 0,
+         !is.na(county_viral_richness), county_viral_richness > 0)
+
+fit_county <- glm(county_viral_richness ~ log(host_sampling_richness),
+                  family = poisson(), data = df_county)
+
+p_county <- ggplot(df_county,
+                   aes(x = host_sampling_richness, y = county_viral_richness)) +
+  geom_point(alpha = 0.7, size = 2.7) +
+  stat_smooth(method = "glm",
+              method.args = list(family = "poisson"),
+              se = TRUE,
+              color = pal$pos) +
+  scale_x_log10() +
+  labs(
+    title = "C. County level: Viral richness vs host richness per county",
+    x = "Host species richness per county (log10 scale)",
+    y = "County viral richness"
+  ) +
+  theme_pub()
+
+p_county
+
+
+summary(fit_pop)
+
+
+coef_pop <- summary(fit_pop)$coefficients["log(n_pop)",]
+
+beta_pop  <- coef_pop["Estimate"]
+se_pop    <- coef_pop["Std. Error"]
+z_pop     <- coef_pop["z value"]
+p_pop     <- coef_pop["Pr(>|z|)"]
+
+
+null_pop  <- glm(viral_pop ~ 1, family = poisson(), data = df_pop2)
+pseudoR2_pop <- 1 - logLik(fit_pop) / logLik(null_pop)
+
+cat("\n===== Population level stats =====\n")
+cat("Beta =", round(beta_pop,3), "\n")
+cat("SE   =", round(se_pop,3), "\n")
+cat("z    =", round(z_pop,3), "\n")
+cat("p    =", signif(p_pop,3), "\n")
+cat("Pseudo R2 =", round(pseudoR2_pop,3), "\n")
+
+
+summary(fit_county)
+
+coef_county <- summary(fit_county)$coefficients["log(host_sampling_richness)",]
+
+beta_county <- coef_county["Estimate"]
+se_county   <- coef_county["Std. Error"]
+z_county    <- coef_county["z value"]
+p_county    <- coef_county["Pr(>|z|)"]
+
+null_county  <- glm(county_viral_richness ~ 1,
+                    family = poisson(), data = df_county)
+pseudoR2_county <- 1 - logLik(fit_county) / logLik(null_county)
+
+cat("\n===== County level stats =====\n")
+cat("Beta =", round(beta_county,3), "\n")
+cat("SE   =", round(se_county,3), "\n")
+cat("z    =", round(z_county,3), "\n")
+cat("p    =", signif(p_county,3), "\n")
+cat("Pseudo R2 =", round(pseudoR2_county,3), "\n")
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readxl)
+library(ggsci)
+
+
+virus_df <- read_excel(
+  "C:/Users/tanzh/OneDrive/桌面/R_study/Map/副本000-virus_20260310-ve_vs.xlsx"
+)
+
+stopifnot(all(c("Library", "Order", "Province") %in% colnames(virus_df)))
+
+
+host_df <- read_excel(
+  "C:/Users/tanzh/OneDrive/桌面/R_study/Map/副本host_virus-XL-Zone-BoundaryMatch_20260115.xlsx"
+)
+
+stopifnot(all(c("Library", "zone") %in% colnames(host_df)))
+
+zone_map <- host_df %>%
+  dplyr::select(Library, zone) %>%
+  distinct()
+
+virus_df <- virus_df %>%
+  left_join(zone_map, by = "Library")
+
+
+cat("???? 病毒记录按 zone 分布如下：\n")
+print(table(virus_df$zone, useNA = "ifany"))
+
+
+virus_summary <- virus_df %>%
+  filter(!is.na(zone), !is.na(Order)) %>%
+  group_by(zone, Order) %>%
+  summarise(
+    total_virus_records     = n(),
+    n_libraries              = n_distinct(Library),
+    mean_virus_per_library   = total_virus_records / n_libraries,
+    .groups = "drop"
+  )
+
+
+virus_summary <- virus_summary %>%
+  mutate(
+    Order = factor(
+      Order,
+      levels = c(
+        "Rodentia",        
+        "Eulipotyphla",    
+        "Lagomorpha"       
+      )
+    )
+  ) %>%
+  arrange(Order, zone)
+
+stopifnot(!any(is.na(virus_summary$Order)))
+
+
+max_total <- max(virus_summary$total_virus_records, na.rm = TRUE)
+
+max_mean  <- max(virus_summary$mean_virus_per_library, na.rm = TRUE)
+scale_fac <- max_total / max_mean
+scale_fac
+
+col_bar  <- pal_npg("nrc")(10)[4]  
+col_line <- pal_npg("nrc")(10)[2]  
+
+p_virus <- ggplot(virus_summary, aes(x = factor(zone))) +
+  
+
+  geom_col(
+    aes(y = total_virus_records),
+    fill  = col_bar,
+    alpha = 0.45,
+    width = 0.6
+  ) +
+  
+  geom_line(
+    aes(
+      y = mean_virus_per_library * scale_fac,
+      group = 1
+    ),
+    color = col_line,
+    size  = 1.3
+  ) +
+  
+  geom_point(
+    aes(y = mean_virus_per_library * scale_fac),
+    color = col_line,
+    size  = 2.6
+  ) +
+  
+  facet_wrap(~ Order, ncol = 3, scales = "fixed") +
+  
+  scale_y_continuous(
+    name = "Total virus detections",
+    sec.axis = sec_axis(
+      ~ . / scale_fac,
+      name = "Mean viruses per library"
+    )
+  ) +
+  
+  labs(
+    title = "Viral detections and mean viral burden per library across zones",
+    subtitle = "Mean viral burden per library is emphasized",
+    x = "Zone"
+  ) +
+  
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray40"),
+    strip.text = element_text(face = "bold", size = 11),
+    legend.position = "none",
+    axis.title.y.left  = element_text(color = col_bar),
+    axis.title.y.right = element_text(color = col_line),
+    panel.grid = element_blank()
+  )
+
+p_virus
+
+library(patchwork)
+
+p_virus2 <- p_virus + labs(title = NULL, subtitle = NULL)
+p_virus2
+
+
+p_hosts2 <- p_host_virus + labs(title = NULL, subtitle = NULL)
+p_hosts2
+
+p_zone_host <- 
+  p_virus2 /
+  p_hosts2 +
+  plot_layout(
+    heights = c(1, 1)   
+  ) 
+
+p_zone_host
+
+
+global_max_total <- max(
+  max(virus_summary$total_virus_records, na.rm = TRUE),
+  max(virus_summary_host$total_virus_records, na.rm = TRUE)
+)
+
+global_max_mean <- max(
+  max(virus_summary$mean_virus_per_library, na.rm = TRUE),
+  max(virus_summary_host$mean_virus_per_library, na.rm = TRUE)
+)
+
+global_scale_fac <- global_max_total / global_max_mean
+
+p_virus <- ggplot(virus_summary, aes(x = factor(zone))) +
+  geom_col(
+    aes(y = total_virus_records),
+    fill  = col_bar,
+    alpha = 0.45,
+    width = 0.6
+  ) +
+  geom_line(
+    aes(y = mean_virus_per_library * global_scale_fac, group = 1),
+    color = col_line,
+    size  = 1.3
+  ) +
+  geom_point(
+    aes(y = mean_virus_per_library * global_scale_fac),
+    color = col_line,
+    size  = 2.6
+  ) +
+  facet_wrap(~ Order, ncol = 3, scales = "fixed") +
+  scale_y_continuous(
+    limits = c(0, global_max_total),
+    name = "Total virus detections",
+    sec.axis = sec_axis(
+      ~ . / global_scale_fac,
+      name = "Mean viruses per library"
+    )
+  ) +
+  theme_bw(base_size = 13)+
+  theme(
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+p_hosts <- ggplot(virus_summary_host, aes(x = factor(zone))) +
+  geom_col(
+    aes(y = total_virus_records),
+    fill  = col_bar,
+    alpha = 0.45,
+    width = 0.6
+  ) +
+  geom_line(
+    aes(y = mean_virus_per_library * global_scale_fac, group = 1),
+    color = col_line,
+    size  = 1.3
+  ) +
+  geom_point(
+    aes(y = mean_virus_per_library * global_scale_fac),
+    color = col_line,
+    size  = 2.6
+  ) +
+  facet_wrap(~ Host_species, ncol = 3, scales = "fixed") +
+  scale_y_continuous(
+    limits = c(0, global_max_total),
+    name = "Total virus detections",
+    sec.axis = sec_axis(
+      ~ . / global_scale_fac,
+      name = "Mean viruses per library"
+    )
+  ) +
+  theme_bw(base_size = 13)+
+  theme(
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+
+library(patchwork)
+
+p_zone_host <-
+  (p_virus + labs(title = NULL, subtitle = NULL)) /
+  (p_hosts + labs(title = NULL, subtitle = NULL)) +
+  plot_layout(heights = c(1, 1)) +
+  plot_annotation(
+    tag_levels = "a",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 14)
+    )
+  )
+
+p_zone_host
+
+library(patchwork)
+
+pa <- pA    + labs(title = NULL)
+pb <- pB       + labs(title = NULL)
+pC <- p_population            + labs(title = NULL)
+pD <- p_county            + labs(title = NULL)
+pE <- p_zone_host             + labs(title = NULL)
+pF <- p_all_xy              + labs(title = NULL)
+
+p_all <- (pC | pD| pE) /
+  pa /
+  pF +
+  plot_layout(
+    heights = c(1.2, 1, 1),
+    guides  = "collect"
+  ) +
+  plot_annotation(
+    tag_levels = "a",
+    theme = theme(
+      plot.tag = element_text(size = 13, face = "bold")
+    )
+  )
+
+
+p_all
+
+
+ggsave(
+  file.path(out_dir, "AlphaDiversity_5panels_abcdefg_vs_V5.pdf"),
+  p_all,
+  width  = 14,
+  height = 14,
+  units  = "in"
+)
