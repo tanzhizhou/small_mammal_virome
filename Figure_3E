@@ -1,0 +1,321 @@
+root_dir <- "C:/Users/tanzh/OneDrive/桌面/R_study/Map"
+eco_dir  <- file.path(root_dir, "plots_alpha_3levels")
+
+eco_file   <- "host_with_all_eco_library_level_individual_specific.xlsx"
+virus_file <- "副本000-virus_20260310-specific.xlsx"
+host_file  <- "副本host_virus-XL-Zone-BoundaryMatch_20260115.xlsx"
+
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggsci)
+library(MASS)
+library(cowplot)
+
+
+eco        <- readxl::read_excel(file.path(eco_dir, eco_file))
+virus_list <- readxl::read_excel(file.path(root_dir, virus_file))
+host_list  <- readxl::read_excel(file.path(root_dir, host_file))
+
+
+host_col <- intersect(
+  c("Host_species","Host","Host_species_name","Host_species_CN"),
+  names(host_list)
+)
+if (length(host_col) == 0) stop("No Host_species column found")
+host_list <- host_list %>% dplyr::rename(Host_species = !!host_col[1])
+
+zone_col <- intersect(c("zone","Zone","Zoogeographic_zone"), names(host_list))
+if (length(zone_col) == 0) stop("No zone column found")
+host_list <- host_list %>% dplyr::rename(zone = !!zone_col[1])
+
+stopifnot(all(c("Library","Province_County","zone") %in% names(host_list)))
+stopifnot("Library" %in% names(virus_list))
+stopifnot("Library" %in% names(eco))
+
+
+virus_lib <- virus_list %>%
+  dplyr::filter(!is.na(Library), !is.na(Host_species)) %>%
+  dplyr::group_by(Library, Host_species) %>%
+  dplyr::summarise(
+    virus_count = dplyr::n(),
+    .groups = "drop"
+  )
+
+
+loc_map <- host_list %>%
+  dplyr::select(Library, zone, Province_County) %>%
+  dplyr::distinct()
+
+dat_lib <- virus_lib %>%
+  dplyr::left_join(loc_map, by = "Library") %>%
+  dplyr::left_join(
+    eco %>%
+      dplyr::select(
+        Library,
+        CPC1, CPC2, CPC3,
+        APC1, APC2,
+        log_pop_density,
+        host_sampling_richness
+      ),
+    by = "Library"
+  ) %>%
+  dplyr::filter(!is.na(zone), !is.na(Province_County)) %>%
+  tidyr::drop_na()
+
+dat_lib$Host_species <- factor(dat_lib$Host_species)
+
+
+host_keep_df <- dat_lib %>%
+  dplyr::group_by(Host_species) %>%
+  dplyr::summarise(
+    n_zone    = dplyr::n_distinct(zone),
+    n_county  = dplyr::n_distinct(Province_County),
+    n_library = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(
+    n_zone   >= 2,
+    n_county >= 10
+  )
+
+dat_lib2 <- dat_lib %>%
+  dplyr::filter(Host_species %in% host_keep_df$Host_species)
+
+
+vars_group <- list(
+  Climate  = c("CPC1","CPC2","CPC3"),
+  Landuse  = c("APC1","APC2","log_pop_density"),
+  Sampling = c("host_sampling_richness")
+)
+
+group_list  <- list()
+bubble_list <- list()
+
+for (h in unique(dat_lib2$Host_species)) {
+  
+  dfh <- dat_lib2 %>% dplyr::filter(Host_species == h)
+  if (nrow(dfh) < 20) next
+  
+  vars_use <- unlist(vars_group)
+  vars_use <- vars_use[
+    sapply(dfh[vars_use], function(x) stats::sd(x, na.rm = TRUE) > 0)
+  ]
+  if (length(vars_use) == 0) next
+  
+  ## null model
+  m_null <- tryCatch(
+    MASS::glm.nb(virus_count ~ 1, data = dfh),
+    error = function(e) NULL
+  )
+  if (is.null(m_null)) next
+  dev_null <- stats::deviance(m_null)
+  if (!is.finite(dev_null) || dev_null <= 0) next
+  
+  ## full model
+  fml_full <- stats::as.formula(
+    paste("virus_count ~", paste(vars_use, collapse = " + "))
+  )
+  m_full <- tryCatch(
+    MASS::glm.nb(fml_full, data = dfh),
+    error = function(e) NULL
+  )
+  if (is.null(m_full)) next
+  dev_full <- stats::deviance(m_full)
+  
+  contrib <- c()
+  
+  for (g in names(vars_group)) {
+    vars_drop <- intersect(vars_group[[g]], vars_use)
+    if (length(vars_drop) == 0) {
+      contrib[g] <- 0
+      next
+    }
+    
+    fml_drop <- stats::as.formula(
+      paste(
+        "virus_count ~",
+        paste(setdiff(vars_use, vars_drop), collapse = " + ")
+      )
+    )
+    
+    m_drop <- tryCatch(
+      MASS::glm.nb(fml_drop, data = dfh),
+      error = function(e) NULL
+    )
+    
+    if (is.null(m_drop)) {
+      contrib[g] <- 0
+    } else {
+      dd <- stats::deviance(m_drop) - dev_full
+      contrib[g] <- max(0, dd / dev_null * 100)
+    }
+  }
+  
+  unexplained <- max(0, 100 - sum(contrib))
+  
+  group_list[[as.character(h)]] <- data.frame(
+    Host_species = as.character(h),
+    Group        = c("Climate","Landuse","Sampling","Unexplained"),
+    Percent      = c(contrib["Climate"], contrib["Landuse"],
+                     contrib["Sampling"], unexplained),
+    stringsAsFactors = FALSE
+  )
+  
+  coefs <- stats::coef(summary(m_full))
+  keep_coef <- intersect(vars_use, rownames(coefs))
+  
+  bubble_list[[as.character(h)]] <- data.frame(
+    Host_species = as.character(h),
+    Variable     = keep_coef,
+    Estimate     = coefs[keep_coef, "Estimate"],
+    stringsAsFactors = FALSE
+  )
+}
+
+group_df  <- dplyr::bind_rows(group_list)
+bubble_df <- dplyr::bind_rows(bubble_list)
+
+
+host_label_df <- host_keep_df %>%
+  dplyr::mutate(
+    Host_species = as.character(Host_species),
+    Host_label = paste0(
+      Host_species, "\n",
+      "county = ", n_county, ", libraries = ", n_library
+    )
+  )
+
+group_df <- group_df %>%
+  dplyr::left_join(
+    host_label_df %>% dplyr::select(Host_species, Host_label),
+    by = "Host_species"
+  )
+
+host_order_df <- group_df %>%
+  dplyr::filter(Group != "Unexplained") %>%
+  dplyr::group_by(Host_label) %>%
+  dplyr::summarise(total_explained = sum(Percent), .groups = "drop") %>%
+  dplyr::arrange(dplyr::desc(total_explained))
+
+
+host_levels <- rev(host_order_df$Host_label)
+
+group_df <- group_df %>%
+  dplyr::mutate(
+    Host_label = factor(Host_label, levels = host_levels),
+    Group = factor(
+      Group,
+      levels = c("Climate","Landuse","Sampling","Unexplained")
+    )
+  )
+
+bubble_df <- bubble_df %>%
+  dplyr::left_join(
+    host_label_df %>% dplyr::select(Host_species, Host_label),
+    by = "Host_species"
+  ) %>%
+  dplyr::mutate(
+    Host_label = factor(Host_label, levels = host_levels),
+    AbsEst = abs(Estimate),
+    Sign   = ifelse(Estimate > 0, "Positive", "Negative"),
+    Group_var = dplyr::case_when(
+      Variable %in% vars_group$Climate  ~ "Climate",
+      Variable %in% vars_group$Landuse  ~ "Landuse",
+      TRUE                              ~ "Sampling"
+    )
+  )
+
+
+group_df <- group_df %>%
+  dplyr::mutate(
+    Group = factor(
+      Group,
+      levels = c("Climate", "Landuse", "Sampling", "Unexplained")
+    )
+  )
+group_df
+p_bar <- ggplot(
+  group_df,
+  aes(x = Percent, y = Host_label, fill = Group)
+) +
+  geom_col(width = 0.5, position = position_stack(reverse = TRUE)) +
+  scale_x_continuous(
+    limits = c(0,100),
+    breaks = c(0,50,100),
+    expand = c(0,0)
+  ) +
+  scale_fill_manual(
+    values = c(
+      Climate     = pal_npg("nrc")(10)[3],
+      Landuse     = pal_npg("nrc")(10)[2],
+      Sampling    = pal_npg("nrc")(10)[6],
+      Unexplained = "grey80"
+    )
+  ) +
+  labs(x = "Explained deviance (%)", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    #legend.position = "none",       
+    #plot.margin = margin(t = 5.5, r = 0, b = 5.5, l = 5.5, unit = "pt")
+  )
+p_bar 
+
+p_bubble <- ggplot(
+  bubble_df,
+  aes(
+    x = Variable,
+    y = Host_label,
+    size = AbsEst,
+    fill = Sign
+  )
+) +
+  geom_point(shape = 21, color = "black", stroke = 0.3) +
+  facet_grid(. ~ Group_var, scales = "free_x", space = "free_x") +
+  scale_fill_manual(
+    values = c(
+      Positive = pal_jama()(7)[2],
+      Negative = pal_jama()(7)[6]
+    )
+  ) +
+  scale_size_continuous(range = c(2,6)) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.margin = margin(t = 5.5, r = 5.5, b = 5.5, l = 0, unit = "pt")
+  )
+
+p_bubble <- p_bubble +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, vjust = 1),  # ← 新增
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.margin = margin(t = 5.5, r = 5.5, b = 5.5, l = 0, unit = "pt")
+  )
+p_bubble
+
+aligned <- cowplot::align_plots(
+  p_bar, p_bubble,
+  align = "v",
+  axis  = "lr"
+)
+
+pA <- cowplot::plot_grid(
+  aligned[[1]],
+  aligned[[2]],
+  nrow = 1,
+  rel_widths = c(0.35, 0.65)
+)
+pA
