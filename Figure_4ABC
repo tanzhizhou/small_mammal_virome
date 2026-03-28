@@ -1,0 +1,268 @@
+library(readxl)
+library(tidyr)
+library(Rtsne)
+library(ggplot2)
+library(ggsci)
+library(vegan)
+library(ape)
+library(geosphere)
+library(tibble)
+library(dplyr)
+
+virus_list <- read_excel("副本000-virus_20260310-ve_vs.xlsx")  
+host_list  <- read_excel("副本host_virus-XL-Zone-BoundaryMatch_20260115.xlsx")  
+
+
+virome_matrix <- virus_list %>%
+  dplyr::select(Library, Virus) %>%
+  distinct() %>%               
+  mutate(presence = 1) %>%
+  pivot_wider(names_from = Virus,
+              values_from = presence,
+              values_fill = list(presence = 0)) %>%
+  column_to_rownames("Library")
+
+
+virome_matrix_unique <- virome_matrix[!duplicated(virome_matrix), ]
+library_names <- rownames(virome_matrix)[!duplicated(virome_matrix)]
+
+
+set.seed(123)
+tsne_res <- Rtsne(as.matrix(virome_matrix_unique), perplexity = 30)
+
+
+virome_order <- virus_list %>%
+  dplyr::select(Library, Order) %>%
+  distinct(Library, .keep_all = TRUE)
+
+
+
+tsne_df <- data.frame(Library = library_names,
+                      X = tsne_res$Y[,1],
+                      Y = tsne_res$Y[,2]) %>%
+  left_join(virome_order, by="Library") %>%
+  left_join(host_list %>% dplyr::select(Library, zone), by="Library")
+
+
+
+duplicate_libraries <- host_list %>%
+  group_by(Library) %>%
+  filter(n() > 1) %>%  
+  ungroup()
+
+duplicate_libraries
+#library(writexl)
+
+# 导出重复 Library 信息到 Excel
+#write_xlsx(duplicate_libraries, "duplicate_libraries.xlsx")
+
+
+order_colors <- c("Eulipotyphla"="#22804c", "Lagomorpha"="#0c6ba9", "Rodentia"="#b33c28")
+
+p_tsne <- ggplot(tsne_df, aes(x = X, y = Y, color = Order)) +
+  geom_point(size = 2, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "t-SNE of viromes colored by host Order") +
+  scale_color_manual(values = order_colors)
+p_tsne
+ggsave(
+  filename = "tSNE_viromes_by_host_Order_vs.pdf",
+  plot     = p_tsne,
+  width    = 7,
+  height   = 6,
+  units    = "in"
+)
+
+write.csv(tsne_df, "tsne_coordinates_vs.csv", row.names=FALSE)
+
+
+virome_matrix <- virome_matrix[virome_order$Library, ]
+dist_matrix <- vegdist(virome_matrix, method="jaccard")
+set.seed(123)
+adonis_res <- adonis2(dist_matrix ~ Order, data=virome_order, permutations=999)
+print(adonis_res)
+
+
+
+library(dplyr)
+library(readxl)
+
+host_list <- read_excel("副本host_virus-XL-Zone-BoundaryMatch_20260115.xlsx")
+
+tsne_anno <- tsne_df %>%
+  left_join(
+    host_list %>% 
+      dplyr::select(Library,
+             Host_species,
+             Host_order,
+             Province,
+             County,
+             zone),
+    by = "Library"
+  )
+
+#install.packages("dbscan")
+library(dbscan)
+
+set.seed(123)
+
+tsne_clusters <- tsne_anno %>%
+  mutate(
+    cluster = dbscan(
+      tsne_anno[, c("X", "Y")],
+      eps = 2.5,      # ?????? 需要你稍微调，2–4 常见
+      minPts = 10
+    )$cluster
+  ) %>%
+  filter(cluster != 0)   # 去掉噪声点
+
+
+
+cluster_summary <- tsne_clusters %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    
+
+    top_species = names(sort(table(Host_species), decreasing = TRUE))[1],
+    species_prop = max(prop.table(table(Host_species))),
+    
+
+    top_county = names(sort(table(County), decreasing = TRUE))[1],
+    county_prop = max(prop.table(table(County))),
+    
+    .groups = "drop"
+  ) %>%
+  filter(
+    n >= 10,              
+    species_prop >= 0.5,  
+    county_prop  >= 0.5   
+  )
+
+
+tsne_clusters2 <- tsne_clusters %>%
+  left_join(
+    cluster_summary %>%
+      dplyr::select(cluster, top_species, top_county),
+    by = "cluster"
+  )
+
+label_df <- tsne_clusters2 %>%
+  filter(!is.na(top_species)) %>%   
+  group_by(cluster) %>%
+  summarise(
+    X = mean(X),
+    Y = mean(Y),
+    label = paste0(
+      unique(top_county), "\n",
+      unique(top_species)
+    ),
+    .groups = "drop"
+  )
+label_df
+
+library(ggrepel)
+
+p_tsne_annotated <- ggplot(tsne_clusters, aes(X, Y, color = Order)) +
+  geom_point(size = 1.8, alpha = 0.7) +
+  geom_text_repel(
+    data = label_df,
+    aes(X, Y, label = label),
+    inherit.aes = FALSE,
+    size = 3.8,
+    fontface = "bold",
+    color = "black",
+    box.padding = 0.6,
+    max.overlaps = Inf
+  ) +
+  theme_minimal() +
+  labs(
+    title = "t-SNE of viromes with county- and host species–enriched clusters"
+  ) +
+  scale_color_manual(values = order_colors)
+p_tsne_annotated
+ggsave(
+  "tSNE_viromes_host_region_clusters_vs.png",
+  p_tsne_annotated,
+  width = 8,
+  height = 7
+)
+
+
+
+ggsave(
+  "tSNE_viromes_host_region_clusters_vs.pdf",
+  p_tsne_annotated,
+  width = 8,
+  height = 7
+)
+
+
+
+host_phylo <- read.tree("species-name.nwk")
+library_species <- host_list$Host_species[match(rownames(virome_matrix), host_list$Library)]
+species_in_tree <- library_species[library_species %in% host_phylo$tip.label]
+library_in_tree <- rownames(virome_matrix)[library_species %in% host_phylo$tip.label]
+
+phylo_dist_full <- cophenetic(host_phylo)
+phylo_dist <- phylo_dist_full[species_in_tree, species_in_tree]
+rownames(phylo_dist) <- colnames(phylo_dist) <- library_in_tree
+virome_matrix_phylo <- virome_matrix[library_in_tree, ]
+
+
+host_coords <- host_list %>%
+  dplyr::select(Library, lon, lat, zone) %>%
+  distinct(Library, .keep_all=TRUE) %>%
+  filter(Library %in% library_in_tree) %>%
+  arrange(match(Library, library_in_tree))
+
+coords <- host_coords %>% select(lon, lat)
+geo_dist <- distm(coords)/1000
+rownames(geo_dist) <- host_coords$Library
+colnames(geo_dist) <- host_coords$Library
+
+
+virus_shared <- 1 - vegdist(virome_matrix_phylo, method="jaccard")
+virus_shared <- as.matrix(virus_shared)
+
+
+pairwise_df <- expand.grid(Lib1 = rownames(virome_matrix_phylo),
+                           Lib2 = rownames(virome_matrix_phylo)) %>%
+  filter(Lib1 != Lib2) %>%
+  mutate(
+    virus_sim  = mapply(function(x,y) virus_shared[x,y], Lib1, Lib2),
+    phylo_dist = mapply(function(x,y) phylo_dist[x,y], Lib1, Lib2),
+    geo_dist   = mapply(function(x,y) geo_dist[x,y], Lib1, Lib2)
+  ) %>%
+  left_join(host_coords %>% dplyr::select(Library, zone), by=c("Lib1"="Library")) %>%
+  rename(zone1 = zone) %>%
+  left_join(host_coords %>% dplyr::select(Library, zone), by=c("Lib2"="Library")) %>%
+  rename(zone2 = zone) %>%
+  mutate(same_zone = ifelse(zone1 == zone2, "within_zone", "between_zone"))
+
+
+mean_phylo_species <- mean(pairwise_df$phylo_dist)
+mean_phylo_genus   <- mean(pairwise_df$phylo_dist)  # 可按需要改成 genus 平均
+
+
+p_e_zone <- ggplot(pairwise_df, aes(x=phylo_dist, y=virus_sim, color=same_zone)) +
+  geom_point(alpha=0.1) +
+  geom_smooth(method="gam", formula=y~s(x, bs="cs")) +
+  geom_vline(xintercept=mean_phylo_species, linetype="dashed") +
+  geom_vline(xintercept=mean_phylo_genus, linetype="dashed") +
+  labs(x="Host phylogenetic distance (MYA)", y="Virus sharing similarity") +
+  theme_minimal() +
+  scale_color_manual(values=c("within_zone"="#0c6ba9", "between_zone"="#b33c28"))
+
+
+p_f_zone <- ggplot(pairwise_df, aes(x=geo_dist, y=virus_sim, color=same_zone)) +
+  geom_point(alpha=0.1) +
+  geom_smooth(method="gam", formula=y~s(x, bs="cs")) +
+  labs(x="Geographic distance (km)", y="Virus sharing similarity") +
+  theme_minimal() +
+  scale_color_manual(values=c("within_zone"="#0c6ba9", "between_zone"="#b33c28"))
+
+
+
+ggsave("phylo_vs_virus_sharing_zone_vsve.png", p_e_zone, width=6, height=4)
+ggsave("geo_vs_virus_sharing_zone_vsve.png", p_f_zone, width=6, height=4)
