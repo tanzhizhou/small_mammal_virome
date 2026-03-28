@@ -1,0 +1,346 @@
+library(dplyr)
+library(readxl)
+library(stringr)
+
+virus_list <- read_excel("副本000-virus_20260207.xlsx")  
+head(virus_list)
+host_list <- read_excel("副本host_virus-XL-Zone-BoundaryMatch_20260115.xlsx")
+head(host_list)
+
+
+host_total <- host_list %>%
+  group_by(Host_species) %>%
+  summarise(Total_No = n(), .groups = "drop")
+
+
+virus_pos <- virus_list %>%
+  filter(!is.na(Host_species), !is.na(Viral_family)) %>%
+  group_by(Viral_family, Host_species) %>%
+  summarise(Pos_No = n(), .groups = "drop") %>%
+  mutate(
+    com = paste0(Viral_family, "*", Host_species)   
+  )
+
+
+
+pp_rate <- virus_pos %>%
+  left_join(host_total, by = "Host_species") %>%
+  mutate(
+    Positive_rate = round(Pos_No / Total_No * 100, 3)
+  ) %>%
+  arrange(Viral_family, Host_species)
+
+
+
+head(pp_rate)
+
+
+
+host_class <- read.csv("宿主目对应表.csv",header = T)
+
+
+
+virus_list<- merge(virus_list, host_class, by="Host_species", all.x = TRUE)
+
+
+
+virus_list_sel <- select(virus_list, Virus,Viral_family, Host_species,Genome, Host_order,Host_family)
+
+virus_list_sel_u <-unique(virus_list_sel)
+
+
+data_freq <- as.data.frame(table(virus_list_sel_u$Viral_family, virus_list_sel_u$Host_species, virus_list_sel_u$Genome, virus_list_sel_u$Host_order,virus_list_sel_u$Host_family))
+colnames(data_freq) <- c("Viral_family", "Host_species", "Genome",  "Host_order","Host_family" ,"Freq")
+
+data_freq_filtered <- data_freq %>%
+  filter(Freq > 0)
+
+
+head(data_freq_filtered)
+
+data_freq_filtered$com <- paste(data_freq_filtered$Viral_family, data_freq_filtered$Host_species, sep = '*')
+
+
+library(dplyr)
+
+pp_rate <- pp_rate %>%
+  mutate(Positive_rate_group = case_when(
+    Positive_rate < 25 ~ "<25%",
+    Positive_rate >= 25 & Positive_rate < 50 ~ "25%-50%",
+    Positive_rate >= 50 & Positive_rate < 75 ~ "50%-75%",
+    Positive_rate >= 75 ~ "75%-100%"
+  ))
+
+pp_rate$Positive_rate_group <- factor(pp_rate$Positive_rate_group, 
+                                      levels = c("<25%", "25%-50%", "50%-75%", "75%-100%"))
+
+
+data_freq_filtered2<- merge(data_freq_filtered, pp_rate , by="com")
+
+
+library(ggplot2)
+library(ggh4x)
+library(ggsci)
+
+data_freq_filtered2$Positive_rate_group <- factor(data_freq_filtered2$Positive_rate_group, levels = c("75%-100%","50%-75%","25%-50%", "<25%"))
+
+
+p <- ggplot(data_freq_filtered2, aes(x = interaction(Host_species.x,Host_family), y = Viral_family.x, size = Freq)) +
+  geom_count(aes(colour=Positive_rate_group)) +  
+  scale_size_continuous(range = c(1, 10)) +  
+  facet_grid2(Genome~Host_order, scales = "free") + 
+  theme_minimal() +
+  scale_color_npg()+
+  labs(title = "Bubble Chart of Virus Family vs Host Species", 
+       x = "Host Species", y = "Family", size = "Frequency") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  
+        strip.text.y = element_text(angle = 0),  
+        panel.spacing = unit(1, "lines"),
+        axis.ticks = element_line(colour = "black")) + 
+  coord_cartesian(clip = "off") +
+  guides(x = "axis_nested")
+
+p
+
+
+
+p4<-p + force_panelsizes(rows = c(20,10,1,6,34,34), cols =c(52.5,22.5,165),respect = TRUE)
+
+p4
+ggsave(p4,filename = "Bubble Plot of Virus13.pdf",width = 32,height = 11)
+
+
+
+host_family_virus <- data_freq_filtered2 %>%
+  group_by(Host_family, Viral_family.x) %>%
+  summarise(n = sum(Freq), .groups = "drop")
+
+
+mat <- xtabs(n ~ Host_family + Viral_family.x, data = host_family_virus)
+
+
+chisq_res <- chisq.test(mat)
+
+chisq_res
+chisq_res$stdres %>% round(2)  
+
+residuals_df <- as.data.frame(as.table(chisq_res$stdres))
+colnames(residuals_df) <- c("Host_family", "Viral_family", "Residual")
+
+sig_table <- residuals_df %>%
+  filter(abs(Residual) > 2) %>%
+  arrange(desc(Residual))
+
+write.csv(sig_table, "Significant_host_virus_residuals.csv", row.names = FALSE)
+
+head(sig_table, 20)
+
+
+
+library(ggplot2)
+library(dplyr)
+library(ggsci)
+
+
+residuals_df <- as.data.frame(as.table(chisq_res$stdres))
+colnames(residuals_df) <- c("Host_family", "Viral_family", "Residual")
+
+
+residuals_df$Residual_clamped <- pmax(pmin(residuals_df$Residual, 5), -5)  
+
+
+residuals_df$Host_family <- factor(residuals_df$Host_family,
+                                   levels = unique(residuals_df$Host_family))
+
+
+ggplot(residuals_df, aes(x = Viral_family, y = Host_family, fill = Residual_clamped)) +
+  geom_tile(color = "grey85", linewidth = 0.2) +
+  scale_fill_gradient2(
+    low = "#4575B4", mid = "white", high = "#D73027",
+    limits = c(-5, 5),
+    name = "Standardized residual\n(偏好强度)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 10, face = "bold"),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Host Family Preferences for Virus Families",
+    subtitle = "Red = higher-than-expected occurrence, Blue = lower-than-expected"
+  )
+
+sig_res <- residuals_df %>%
+  filter(abs(Residual) > 2)
+
+ggplot(sig_res, aes(x = Viral_family, y = Host_family, fill = Residual)) +
+  geom_tile(color = "grey90") +
+  scale_fill_gradient2(
+    low = "#4575B4", mid = "white", high = "#D73027",
+    limits = c(-5, 5),
+    name = "Residual"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "Significant Host–Virus Family Preferences (|Residual| > 2)"
+  )
+
+
+library(dplyr)
+library(ggplot2)
+library(ggh4x)
+
+
+residuals_df <- as.data.frame(as.table(chisq_res$stdres))
+colnames(residuals_df) <- c("Host_family", "Viral_family", "Residual")
+
+
+host_map_raw <- virus_list %>%
+  distinct(Host_species, Host_family, Host_order)
+
+
+dup_host <- host_map_raw %>%
+  distinct(Host_family, Host_order) %>%
+  count(Host_family, name = "n_orders") %>%
+  filter(n_orders > 1)
+
+
+host_order_map <- data_freq_filtered2 %>%
+  group_by(Host_family, Host_order) %>%
+  summarise(weight = sum(Freq), .groups = "drop") %>%
+  group_by(Host_family) %>%
+  slice_max(order_by = weight, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(Host_family, Host_order)
+
+
+virus_info <- data_freq_filtered2 %>%
+  select(Viral_family.x, Genome) %>%
+  distinct()
+
+
+sig_res <- residuals_df %>%
+  filter(abs(Residual) > 2) %>%
+  mutate(
+    Viral_family = trimws(Viral_family),
+    Host_family  = trimws(Host_family)
+  ) %>%
+
+  left_join(virus_info, by = c("Viral_family" = "Viral_family.x")) %>%
+
+  left_join(host_order_map, by = "Host_family") %>%
+
+  filter(!is.na(Host_order), !is.na(Genome)) %>%
+
+  distinct(Host_family, Host_order, Viral_family, Genome, .keep_all = TRUE)
+
+
+chk_dup <- sig_res %>%
+  count(Host_family, Viral_family, name = "n_rows") %>%
+  filter(n_rows > 1)
+
+if (nrow(chk_dup) > 0) {
+  sig_res <- sig_res %>%
+    group_by(Host_family, Viral_family) %>%
+    slice_max(order_by = abs(Residual), n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+
+sig_res$Genome <- factor(sig_res$Genome, levels = c("ssRNA(-)","ssRNA(+)", "dsRNA", "dsDNA", "ssDNA","RT???dsDNA" ))
+sig_res$Host_order <- factor(sig_res$Host_order,
+                             levels = sort(unique(sig_res$Host_order)))
+
+
+ggplot(sig_res, aes(x = Viral_family, y = Host_family, fill = Residual)) +
+  geom_tile(color = "grey90", linewidth = 0.25) +
+  scale_fill_gradient2(
+    low = "#4575B4", mid = "white", high = "#D73027",
+    limits = c(-5, 5),
+    name = "Residual"
+  ) +
+  facet_grid2(
+    rows = vars(Host_order),    
+    cols = vars(Genome),         
+    scales = "free",
+    space  = "free"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y  = element_text(size = 9, face = "bold"),
+    strip.text.x = element_text(face = "bold", size = 11),
+    strip.text.y = element_text(angle = 0, face = "bold", size = 11),
+    panel.grid   = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Significant Host–Virus Family Preferences (|Residual| > 2)",
+    subtitle = "Faceted by Virus Genome Type (columns) and Host Order (rows)",
+    x = "Virus Family",
+    y = "Host Family"
+  )
+
+
+
+
+sig_res <- sig_res %>%
+  mutate(
+    Residual_clamped = pmax(pmin(Residual, 5), -5),  
+    label_extreme = case_when(
+      Residual > 5  ~ ">5",
+      Residual < -5 ~ "<-5",
+      TRUE ~ ""
+    )
+  )
+
+
+p<-ggplot(sig_res, aes(x = Viral_family, y = Host_family, fill = Residual_clamped)) +
+  geom_tile(color = "grey90", linewidth = 0.25) +
+  geom_text(aes(label = label_extreme), size = 2.5, color = "black", fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#4575B4", mid = "white", high = "#D73027",
+    limits = c(-5, 5),
+    name = "Residual"
+  ) +
+  facet_grid2(
+    rows = vars(Host_order),    
+    cols = vars(Genome),         
+    scales = "free",
+    space  = "free"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y  = element_text(size = 9, face = "bold"),
+    strip.text.x = element_text(face = "bold", size = 11),
+    strip.text.y = element_text(angle = 0, face = "bold", size = 11),
+    panel.grid   = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Significant Host–Virus Family Preferences (|Residual| > 2)",
+    subtitle = "Red = positive preference, Blue = negative preference\nLabeled cells exceed |Residual| > 5",
+    x = "Virus Family",
+    y = "Host Family"
+  )
+
+p
+
+
+ggsave(
+  filename = "Host_Virus_Preference_heatmap-v2.pdf",
+  plot = p,
+  width = 9,       
+  height = 4,      
+  units = "in",
+  dpi = 600,        
+  device = cairo_pdf 
+)
