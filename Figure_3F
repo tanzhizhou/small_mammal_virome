@@ -1,0 +1,118 @@
+library(readxl)
+library(dplyr)
+library(MASS)
+library(emmeans)
+library(ggplot2)
+library(stringr)
+library(patchwork)  
+
+
+
+df <- read_excel("副本000-virus_20260310-ve_vs.xlsx") %>%
+  filter(
+    !is.na(Host_species),
+    !is.na(Library),
+    !is.na(Virus),
+    !is.na(Province),
+    !is.na(Abb_Host_species),
+    !is.na(Abb_Province),
+    !is.na(Order),
+    !is.na(Batch)                     
+  ) %>%
+  distinct(
+    Host_species, Library, Virus, Province,
+    Abb_Host_species, Abb_Province, Order,
+    Category, Batch                 
+  )
+
+df$Host_species <- gsub("_", " ", df$Host_species)
+
+
+box_data <- df %>%
+  group_by(
+    Host_species, Library, Province,
+    Abb_Host_species, Abb_Province,
+    Order, Batch                      
+  ) %>%
+  summarise(
+    Virus_n = n_distinct(Virus),
+    .groups = "drop"
+  )
+
+
+box_data$Order <- relevel(factor(box_data$Order), ref = "Rodentia")
+
+
+glm_nb2 <- glm.nb(Virus_n ~ Order, data = box_data)
+
+
+box_data$glm_resid <- residuals(glm_nb2, type = "deviance")
+
+
+resid_threshold <- quantile(box_data$glm_resid, 0.75) + 1.5 * IQR(box_data$glm_resid)
+
+
+glm_outliers <- box_data %>% filter(glm_resid > resid_threshold)
+
+
+write.csv(glm_outliers, "glm_outlier_libraries_virus_info0312.csv", row.names = FALSE)
+
+
+
+host_order_all <- box_all %>%
+  group_by(Host_species) %>%
+  summarise(Med = median(Virus_n), .groups = "drop") %>%
+  arrange(desc(Med)) %>%
+  pull(Host_species)
+
+box_all$Host_species <- factor(box_all$Host_species, levels = host_order_all)
+
+p_all_xy <- ggplot(
+  box_all,
+  aes(x = Host_species, y = Virus_n)
+) +
+  geom_boxplot(
+    aes(fill = Order),
+    outlier.shape = NA,
+    alpha = 0.6,
+    width = 0.6
+  ) +
+  geom_jitter(
+    aes(color = Order),
+    width = 0.15,
+    size = 1.2,
+    alpha = 0.5
+  ) +
+  geom_jitter(
+    data = box_all %>% filter(IsOutlier),
+    width = 0.15,    
+    height = 0,       
+    shape = 21,
+    size = 2,
+    fill = "orange",
+    color = "orange"
+  ) +
+  scale_fill_manual(values = host_colors) +
+  scale_color_manual(values = host_colors) +
+  labs(
+    title = "Virus Count per Library (VS viruses)",
+    subtitle = "Negative binomial GLM outliers highlighted",
+    x = "Host Species",
+    y = "Virus Count per Library",
+    fill = "Order",
+    color = "Order"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+    legend.position = "right"
+  )
+
+p_all_xy
+
+ggsave(
+  "boxplot_all_viruses_Xhost_Yvirus.pdf",
+  plot  = p_all_xy,
+  width = 14,
+  height = 7
+)
