@@ -1,0 +1,220 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(iNEXT)
+library(ggplot2)
+
+
+zone <- read_excel("副本host_virus-XL-Zone-BoundaryMatch_20260115.xlsx", col_types = "text") %>%
+  select(zone, Host_order, Host_species) %>%
+  filter(!is.na(zone), !is.na(Host_order), !is.na(Host_species))
+
+# ===================== 2. Abundance table =====================
+zone_species <- zone %>%
+  group_by(zone, Host_order, Host_species) %>%
+  summarise(n = n(), .groups = "drop")
+
+
+zone_list <- zone_species %>%
+  group_split(zone, Host_order) %>%
+  setNames(
+    zone_species %>%
+      distinct(zone, Host_order) %>%
+      mutate(name = paste0("Zone", zone, "_", Host_order)) %>%
+      pull(name)
+  ) %>%
+  lapply(function(df) {
+    x <- df$n
+    names(x) <- df$Host_species
+    x
+  })
+
+
+for (h in unique(zone$Host_order)) {
+  tmp <- zone %>%
+    filter(Host_order == h) %>%
+    count(Host_species, name = "n")
+  zone_list[[paste0("All_hosts_", h)]] <- setNames(tmp$n, tmp$Host_species)
+}
+
+
+D <- iNEXT(zone_list, datatype = "abundance")
+
+
+df <- D$iNextEst$size_based
+
+if ("Method" %in% names(df)) df <- rename(df, method = Method)
+if ("Type"   %in% names(df)) df <- rename(df, method = Type)
+
+df <- df %>%
+  mutate(
+    method = ifelse(grepl("xtra", method, ignore.case = TRUE),
+                    "extrapolation", "interpolation")
+  )
+
+df <- df %>%
+  mutate(Assemblage_raw = Assemblage) %>%
+  separate(
+    Assemblage,
+    into = c("Zone", "Host_order"),
+    sep = "_",
+    fill = "right",
+    remove = FALSE
+  ) %>%
+  mutate(
+    Zone = ifelse(grepl("^All_hosts", Assemblage_raw), "All_hosts", Zone),
+    Host_order = ifelse(
+      grepl("^All_hosts", Assemblage_raw),
+      sub("^All_hosts_", "", Assemblage_raw),
+      Host_order
+    )
+  )
+
+info <- D$DataInfo %>% select(Assemblage, n)
+
+df <- df %>%
+  left_join(info, by = c("Assemblage_raw" = "Assemblage")) %>%
+  rename(max_n = n) %>%
+  mutate(Facet = ifelse(Zone == "All_hosts", "All_hosts", Host_order)) %>%
+  filter(m <= 1.3 * max_n)
+
+
+df_boundary <- df %>%
+  filter(method == "interpolation") %>%
+  group_by(Zone, Host_order) %>%
+  slice_max(m, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+
+host_colors <- c(
+  "Rodentia"     = "#BC3C29",
+  "Eulipotyphla" = "#20854E",
+  "Lagomorpha"   = "#0072B5"
+)
+
+zone_line <- c(
+  "Zone1" = "#A1746E",
+  "Zone2" = "#C3A869",
+  "Zone3" = "#7A9E9F",
+  "Zone4" = "#B3B3B3",
+  "All_hosts" = "#5C5C5C"
+)
+
+
+
+library(patchwork)
+p_total <- ggplot(
+  df %>% filter(Facet == "All_hosts"),
+  aes(x = m, y = qD, linetype = method)
+) +
+  geom_ribbon(
+    aes(ymin = qD.LCL, ymax = qD.UCL,
+        group = interaction(Host_order, method)),
+    fill = "grey85", alpha = 0.6
+  ) +
+  geom_line(
+    aes(color = Host_order,
+        group = interaction(Host_order, method)),
+    linewidth = 1.3
+  ) +
+  geom_point(
+    data = df_boundary %>% filter(Zone == "All_hosts"),
+    aes(color = Host_order),
+    size = 3
+  ) +
+  scale_color_manual(values = host_colors) +
+  scale_linetype_manual(
+    values = c("interpolation" = "solid",
+               "extrapolation" = "dashed")
+  ) +
+  labs(
+    title = "Total",
+    x = "Sampling No. of three host orders",
+    y = "Host species richness"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+
+x_max_hosts <- df %>%
+  filter(Zone != "All_hosts") %>%
+  summarise(max_m = max(m, na.rm = TRUE)) %>%
+  pull(max_m)
+
+x_max_hosts <- ceiling(x_max_hosts / 500) * 500
+
+p_host <- function(order_name) {
+  ggplot(
+    df %>% filter(Host_order == order_name, Zone != "All_hosts"),
+    aes(x = m, y = qD, linetype = method)
+  ) +
+    geom_ribbon(
+      aes(
+        ymin = qD.LCL,
+        ymax = qD.UCL,
+        group = interaction(Zone, method)
+      ),
+      fill = "grey88",
+      alpha = 0.6
+    ) +
+    geom_line(
+      aes(
+        color = Zone,
+        group = interaction(Zone, method)
+      ),
+      linewidth = 1.1
+    ) +
+    geom_point(
+      data = df_boundary %>%
+        filter(Host_order == order_name, Zone != "All_hosts"),
+      aes(color = Zone),
+      size = 2.8
+    ) +
+    # ??? 统一 X 轴标尺（关键）
+    scale_x_continuous(
+      limits = c(0, x_max_hosts),
+      breaks = pretty(c(0, x_max_hosts), n = 4),
+      expand = c(0, 0)
+    ) +
+    scale_color_manual(values = zone_line) +
+    scale_linetype_manual(
+      values = c(
+        "interpolation" = "solid",
+        "extrapolation" = "dashed"
+      )
+    ) +
+    labs(
+      title = order_name,
+      x = "Sampling No. in five biogeographical regions",
+      y = "Host species richness"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+}
+
+
+p_rodentia     <- p_host("Rodentia")
+p_eulipotyphla <- p_host("Eulipotyphla")
+p_lagomorpha   <- p_host("Lagomorpha")
+
+
+p_final <- p_total /
+  (p_rodentia | p_eulipotyphla | p_lagomorpha) +
+  plot_layout(heights = c(1.1, 1))
+
+p_final
+
+
+
+ggsave(
+  "FigC_Rarefaction_layout_final-v3.pdf",
+  p_final,
+  width = 12,
+  height = 7
+)
