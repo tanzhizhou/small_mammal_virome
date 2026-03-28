@@ -1,0 +1,128 @@
+library(readxl)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(vegan)
+library(iNEXT)
+
+
+df  <- read_excel("副本000-virus_20260310-ve_vs.xlsx")      
+df1 <- read_excel("副本000-virus_20260310-ve.xlsx")         
+df2 <- read_excel("副本000-virus_20260310-specific.xlsx")    
+
+
+host_id_col <- "Library"   
+virus_col   <- "Virus"    
+
+
+make_incidence_input <- function(dat, dataset_name, host_id_col = "Library", virus_col = "Virus") {
+  
+
+  dat_use <- dat %>%
+    filter(
+      !is.na(.data[[host_id_col]]),
+      !is.na(.data[[virus_col]])
+    ) %>%
+    distinct(.data[[host_id_col]], .data[[virus_col]])
+  
+
+  nT <- dat_use %>%
+    summarise(nT = n_distinct(.data[[host_id_col]])) %>%
+    pull(nT)
+  
+
+  inc_vec <- dat_use %>%
+    count(.data[[virus_col]], name = "inc") %>%
+    pull(inc)
+  
+
+  out <- c(nT, inc_vec)
+  return(out)
+}
+
+
+data_iNEXT_inc <- list(
+  "Infecting viruses" = make_incidence_input(df,  "Infecting viruses", host_id_col, virus_col),
+  "All viruses"       = make_incidence_input(df1, "All viruses",       host_id_col, virus_col),
+  "Vertebrate-specific viruses" = make_incidence_input(df2, "Vertebrate-specific viruses", host_id_col, virus_col)
+)
+
+
+sapply(data_iNEXT_inc, function(x) x[1])
+
+
+endpoint_hosts <- max(sapply(data_iNEXT_inc, function(x) x[1]), na.rm = TRUE)
+
+D_inc_ext <- iNEXT(
+  data_iNEXT_inc,
+  datatype = "incidence_freq",
+  endpoint = endpoint_hosts
+)
+
+
+dataset_colors <- c(
+  "Infecting viruses" = "#d95f02",
+  "All viruses" = "#7570b3",
+  "Vertebrate-specific viruses" = "#1b9e77"
+)
+
+
+p_ext <- ggiNEXT(D_inc_ext, type = 1, se = TRUE) +
+  scale_color_manual(values = dataset_colors) +
+  scale_fill_manual(values = dataset_colors) +
+  labs(
+    x = "Number of hosts sampled",
+    y = "Virus richness",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = c(0.72, 0.22),
+    legend.background = element_blank(),
+    legend.key = element_blank()
+  )
+
+p_ext
+
+
+obs_manual <- bind_rows(
+  df  %>% mutate(Dataset = "Infecting viruses"),
+  df1 %>% mutate(Dataset = "All viruses"),
+  df2 %>% mutate(Dataset = "Vertebrate-specific viruses")
+) %>%
+  filter(
+    !is.na(.data[[host_id_col]]),
+    !is.na(.data[[virus_col]])
+  ) %>%
+  distinct(Dataset, .data[[host_id_col]], .data[[virus_col]]) %>%
+  group_by(Dataset) %>%
+  summarise(
+    x = n_distinct(.data[[host_id_col]]),
+    y = n_distinct(.data[[virus_col]]),
+    .groups = "drop"
+  )
+
+obs_manual
+
+
+p_ext2 <- p_ext +
+  geom_point(
+    data = obs_manual,
+    aes(x = x, y = y, color = Dataset),
+    size = 2.8,
+    inherit.aes = FALSE
+  )
+
+p_ext2
+
+
+ggsave(
+  "Virus_rarefaction_curve_3groups.pdf",
+  p_ext2,
+  width = 7,
+  height = 4.5,
+  dpi = 300
+)
