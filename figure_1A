@@ -1,0 +1,83 @@
+# ============================================
+
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(ggspatial)
+library(ggnewscale)  
+
+china     <- sf::read_sf("中国_省.geojson")
+nine_line <- sf::read_sf("nine.geojson")
+zone_line <- sf::read_sf("regions_boundary_20260115.geojson") %>%
+  mutate(zone = paste0("Zone ", region_id))
+
+scatter_df <- read.delim2("Province_order_mod3.txt")
+scatter_df_tro <- st_as_sf(scatter_df, coords = c("lon", "lat"), crs = 4326) %>%
+  mutate(Host_order = trimws(Host_order)) %>%
+  mutate(Host_order = tools::toTitleCase(Host_order))
+
+
+scatter_df_tro$Host_order <- factor(
+  scatter_df_tro$Host_order,
+  levels = c("Rodentia", "Eulipotyphla", "Lagomorpha")
+)
+
+zone_colors <- c(
+  "Zone 1" = "#E6D0CC",
+  "Zone 2" = "#EEE2C2",
+  "Zone 3" = "#D0E2E2",
+  "Zone 4" = "#E5E5E5")
+
+nejm_colors <- c(
+  "Rodentia"     = "#BC3C29", # 深红
+  "Eulipotyphla" = "#20854E", # 绿色（NEJM）
+  "Lagomorpha"   = "#0072B5"  # 蓝色（NEJM）
+)
+
+map <- ggplot() +
+geom_sf(
+  data = zone_line,
+  aes(fill = zone),
+  color = "gray50",
+  linewidth = 0.3,
+  alpha = 0.8
+) +
+  scale_fill_manual(name = "Zone", values = zone_colors) +
+  
+
+geom_sf(data = china, fill = NA, color = "gray60", linewidth = 0.3) +
+  geom_sf(data = nine_line, color = "gray50", linewidth = 0.8) +
+
+new_scale_fill() +
+  
+
+geom_sf(
+  data = scatter_df_tro,
+  aes(size = count, fill = Host_order),
+  shape = 21, color = "black", stroke = 0.3, alpha = 0.75
+) +
+  scale_fill_manual(name = "Host type", values = nejm_colors) +
+  
+
+coord_sf(ylim = c(-2387082, 1654989), crs = "+proj=laea +lat_0=40 +lon_0=104") +
+  scale_size_continuous(range = c(1, 5)) +
+  annotation_scale(location = "bl", text_face = "bold") +
+  labs(caption = "Host sampling and animal zones") +
+  theme(
+    text = element_text(size = 18, face = "bold"),
+    panel.background = element_rect(fill = NA),
+    panel.grid.major = element_line(colour = "grey85", size = 0.2),
+    legend.key = element_rect(fill = "white"),
+    legend.position = "bottom",
+    strip.text = element_text(size = 18, face = "bold")
+  ) +
+  facet_wrap(~ Host_order)
+
+map
+ggsave("map_njem-zone_opt_four.pdf", plot = map, width = 10, height = 7)
+
+
+
+
+
