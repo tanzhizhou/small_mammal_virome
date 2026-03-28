@@ -1,0 +1,132 @@
+library(readxl)
+library(tidyverse)
+library(ggalluvial)
+library(ggsci)
+
+
+host_colors <- c(
+  "Rodentia"     = "#BC3C29",  
+  "Eulipotyphla" = "#20854E",  
+  "Lagomorpha"   = "#0072B5"   
+)
+
+
+df_host <- read_excel("副本host_virus-XL-Zone-BoundaryMatch_20260115.xlsx", col_types = "text")
+
+df_host %>% count(Host_order, sort = TRUE)
+df_host %>% mutate(Host_order = stringr::str_trim(Host_order)) %>% count(Host_order, sort = TRUE)
+
+family_species_count <- df_host %>%
+  group_by(Host_family) %>%
+  summarise(species_count = n_distinct(Host_species), .groups = "drop")
+
+df_summary <- df_host %>%
+  group_by(zone, Host_order, Host_family) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  left_join(family_species_count, by = "Host_family")
+
+zone_summary <- df_host %>%
+  count(zone, name = "samples") %>%
+  mutate(zone_label = paste0("Zone", zone, " (", samples, ")"))
+
+df_alluvial <- df_summary %>%
+  left_join(zone_summary, by = "zone") %>%
+  mutate(
+    Zone_label = factor(zone, levels = zone_summary$zone),
+    Host_order = factor(Host_order, levels = c("Rodentia", "Eulipotyphla", "Lagomorpha")),
+    Family_label = paste0(Host_family, " (", species_count, " spp)")
+  )
+
+
+df_alluvial %>%
+  group_by(Family_label) %>%
+  summarise(n_orders = n_distinct(Host_order), .groups = "drop") %>%
+  arrange(desc(n_orders))
+
+df_alluvial %>%
+  group_by(Zone_label) %>%
+  summarise(n_orders = n_distinct(Host_order), .groups = "drop") %>%
+  arrange(desc(n_orders))
+
+
+p <- ggplot(
+  df_alluvial,
+  aes(axis1 = Zone_label, axis2 = Host_order, axis3 = Family_label, y = n)
+) +
+  geom_alluvium(
+    aes(fill = Host_order),
+    width = 0.25,
+    alpha = 0.6
+  ) +
+
+
+  geom_stratum(
+    width = 0.12,
+    fill  = "grey90",
+    color = "grey40",
+    alpha = 0.85
+  ) +
+
+  scale_fill_manual(
+    values = host_colors,
+    name = "Host order",
+    breaks = names(host_colors),
+    na.translate = FALSE
+  ) +
+
+  scale_x_discrete(
+    limits = c("Zone", "Host order", "Family"),
+    expand = c(0.12, 0.12)
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    axis.text.x = element_text(size = 13, face = "bold"),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.margin = margin(20, 180, 20, 60)
+  ) +
+  labs(
+    title = "Host family composition by ecological zone",
+    subtitle = "Zone → Host order → Family (species counts per family)",
+    x = NULL, y = NULL
+  )
+
+
+gg_data <- ggplot_build(p)$data[[2]] %>%
+  as_tibble() %>%
+  filter(stratum %in% df_alluvial$Family_label)
+
+p_final <- p +
+  geom_segment(
+    data = gg_data,
+    inherit.aes = FALSE,
+    aes(
+      x = x,
+      xend = x + 0.2,
+      y = y,
+      yend = y
+    ),
+    color = "grey40",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    data = gg_data,
+    inherit.aes = FALSE,
+    aes(
+      x = x + 0.25,
+      y = y,
+      label = stratum
+    ),
+    hjust = 0,
+    size = 3.3,
+    color = "black",
+    family = "sans"
+  )
+
+
+
+ggsave("Zone_HostFamily_Alluvial_NEJM_leaderline2.pdf",
+       p_final, width = 12, height = 6, dpi = 600, bg = "white")
