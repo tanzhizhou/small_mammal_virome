@@ -1,0 +1,197 @@
+library(readxl)
+library(circlize)
+library(dplyr)
+
+data <- read_excel("virus_infect.xlsx")
+
+edges <- data.frame(
+  from = data$virus_name_abb,
+  to = data$Host_species,
+  human_contact = data$human_contact,
+  row_id = 1:nrow(data)
+)
+
+all_nodes <- unique(c(edges$from, edges$to))
+nodes <- data.frame(
+  name = all_nodes,
+  type = ifelse(all_nodes %in% data$virus_name_abb, "virus", "host"),
+  stringsAsFactors = FALSE
+)
+
+virus_info <- data %>%
+  select(virus_name_abb, pathogenicity) %>%
+  distinct()
+nodes <- nodes %>%
+  left_join(virus_info, by = c("name" = "virus_name_abb"))
+
+host_info <- data %>%
+  select(Host_species, host_order, Host_family, Host_genus) %>%
+  distinct()
+nodes <- nodes %>%
+  left_join(host_info, by = c("name" = "Host_species"))
+
+if("known_infect_host" %in% colnames(data)) {
+  known_hosts <- data %>%
+    select(virus_name_abb, Host_species, known_infect_host) %>%
+    filter(!is.na(known_infect_host), known_infect_host != "") %>%
+    mutate(host_list = strsplit(as.character(known_infect_host), ";")) %>%
+    tidyr::unnest(host_list) %>%
+    mutate(host_list = trimws(host_list)) %>%
+    filter(host_list != "") %>%
+    mutate(host_type = ifelse(host_list == "human", "human", "other_animal")) %>%
+    select(Host_species, known_host = host_list, host_type) %>%
+    distinct()
+} else {
+  known_hosts <- data.frame(Host_species = character(), known_host = character(), host_type = character())
+}
+
+virus_data_sorted <- data %>%
+  select(virus_name_abb, pathogenicity) %>%
+  distinct() %>%
+  arrange(pathogenicity)
+virus_order_by_type <- c()
+for(patho in c(1,2)) {
+  viruses_of_type <- virus_data_sorted %>% filter(pathogenicity == patho) %>% pull(virus_name_abb)
+  virus_order_in_table <- unique(data$virus_name_abb[data$virus_name_abb %in% viruses_of_type])
+  virus_order_by_type <- c(virus_order_by_type, virus_order_in_table)
+}
+virus_nodes <- nodes %>%
+  filter(type == "virus") %>%
+  arrange(match(name, virus_order_by_type))
+
+host_nodes <- nodes %>%
+  filter(type == "host") %>%
+  arrange(host_order, Host_family, Host_genus, name)
+
+reordered_nodes <- rbind(host_nodes, virus_nodes)
+all_nodes_reordered <- reordered_nodes$name
+
+mat <- matrix(0, nrow = length(all_nodes_reordered), ncol = length(all_nodes_reordered),
+              dimnames = list(all_nodes_reordered, all_nodes_reordered))
+for(i in 1:nrow(edges)) {
+  mat[edges$from[i], edges$to[i]] <- mat[edges$from[i], edges$to[i]] + 1
+}
+
+virus_colors <- c("1" = "#9692B1", "2" = "#C9A063")
+host_colors_no_alpha <- c("Rodentia" = "#BC3C29", "Lagomorpha" = "#0072B5", "Eulipotyphla" = "#20854E", "other" = "#984EA3")
+host_colors_with_alpha <- sapply(host_colors_no_alpha, function(color) adjustcolor(color, alpha.f = 0.7))
+known_host_colors <- c("human" = "#9692B1", "other_animal" = "#C9A063")
+contact_height <- c("High" = 3, "Medium" = 2, "Low" = 1)
+
+node_colors <- rep(NA, length(all_nodes_reordered))
+names(node_colors) <- all_nodes_reordered
+for(node in all_nodes_reordered) {
+  if(node %in% data$virus_name_abb) {
+    patho <- nodes$pathogenicity[nodes$name == node][1]
+    node_colors[node] <- if(!is.na(patho) && as.character(patho) %in% names(virus_colors)) virus_colors[as.character(patho)] else "#F0F0F0"
+  } else {
+    order <- nodes$host_order[nodes$name == node][1]
+    node_colors[node] <- if(!is.na(order) && order %in% names(host_colors_with_alpha)) host_colors_with_alpha[order] else adjustcolor("#CCCCCC", alpha.f = 0.7)
+  }
+}
+
+gap_degrees <- rep(1, length(all_nodes_reordered))
+names(gap_degrees) <- all_nodes_reordered
+host_categories <- sapply(all_nodes_reordered, function(node) if(node %in% host_nodes$name) nodes$host_order[nodes$name == node][1] else NA)
+for(i in 2:length(host_categories)) {
+  if(!is.na(host_categories[i]) && !is.na(host_categories[i-1]) && host_categories[i] != host_categories[i-1]) gap_degrees[i] <- 3
+}
+host_families <- sapply(all_nodes_reordered, function(node) if(node %in% host_nodes$name) nodes$Host_family[nodes$name == node][1] else NA)
+for(i in 2:length(host_families)) {
+  if(!is.na(host_families[i]) && !is.na(host_families[i-1]) && host_families[i] != host_families[i-1] && gap_degrees[i] == 1) gap_degrees[i] <- 2
+}
+first_virus_index <- which(all_nodes_reordered %in% virus_nodes$name)[1]
+if(!is.na(first_virus_index) && first_virus_index > 1) gap_degrees[first_virus_index] <- 5
+virus_types <- sapply(all_nodes_reordered, function(node) if(node %in% virus_nodes$name) nodes$pathogenicity[nodes$name == node][1] else NA)
+for(i in 2:length(virus_types)) {
+  if(!is.na(virus_types[i]) && !is.na(virus_types[i-1]) && virus_types[i] != virus_types[i-1] && all_nodes_reordered[i] %in% virus_nodes$name) gap_degrees[i] <- 3
+}
+
+pdf("virus_host_network_final_v3.pdf", width = 18, height = 16)
+circos.clear()
+par(cex = 0.8, mar = c(0,0,0,0))
+circos.par(start.degree = 90, gap.degree = gap_degrees, track.margin = c(-0.05,0.05), points.overflow.warning = FALSE)
+grid.col <- setNames(node_colors, all_nodes_reordered)
+
+chordDiagram(mat, grid.col = grid.col, transparency = 0.7, directional = 0,
+             direction.type = "diffHeight", diffHeight = -0.04, annotationTrack = NULL,
+             preAllocateTracks = list(list(track.height=0.02), list(track.height=0.02),
+                                      list(track.height=0.06), list(track.height=0.05),
+                                      list(track.height=0.15)),
+             link.sort = TRUE, link.decreasing = TRUE, link.largest.ontop = TRUE,
+             link.border = NA, link.lwd = 1, reduce = 0)
+
+for(host in all_nodes_reordered) {
+  if(host %in% host_nodes$name) {
+    human_known <- known_hosts %>% filter(Host_species == host, host_type == "human") %>% pull(known_host) %>% unique()
+    if(length(human_known) > 0) {
+      xlim <- get.cell.meta.data("xlim", host)
+      sector_width <- xlim[2] - xlim[1]
+      n <- length(human_known)
+      for(j in 1:n) {
+        x_pos <- xlim[1] + (j/(n+1)) * sector_width
+        circos.points(x_pos, 0.5, sector.index = host, track.index = 1, pch = 18, cex = 2.4, col = known_host_colors["human"])
+      }
+    }
+  }
+}
+for(host in all_nodes_reordered) {
+  if(host %in% host_nodes$name) {
+    animal_known <- known_hosts %>% filter(Host_species == host, host_type == "other_animal") %>% pull(known_host) %>% unique()
+    if(length(animal_known) > 0) {
+      xlim <- get.cell.meta.data("xlim", host)
+      sector_width <- xlim[2] - xlim[1]
+      n <- length(animal_known)
+      for(j in 1:n) {
+        x_pos <- xlim[1] + (j/(n+1)) * sector_width
+        circos.points(x_pos, 0.5, sector.index = host, track.index = 2, pch = 18, cex = 1.2, col = known_host_colors["other_animal"])
+      }
+    }
+  }
+}
+
+for(host in unique(edges$to)) {
+  host_links <- edges[edges$to == host, ]
+  if(nrow(host_links) > 0) {
+    xlim <- get.cell.meta.data("xlim", host)
+    sector_width <- xlim[2] - xlim[1]
+    order <- nodes$host_order[nodes$name == host][1]
+    bar_color <- if(!is.na(order) && order %in% names(host_colors_with_alpha)) host_colors_with_alpha[order] else adjustcolor("#CCCCCC", alpha.f = 0.7)
+    n_links <- nrow(host_links)
+    bar_width <- sector_width / (n_links + 1)
+    host_links <- host_links[order(host_links$from, host_links$row_id), ]
+    for(j in 1:n_links) {
+      contact <- host_links$human_contact[j]
+      if(!is.na(contact) && contact %in% names(contact_height)) {
+        x_left <- xlim[1] + j * bar_width
+        x_right <- x_left + bar_width * 0.8
+        bar_height <- contact_height[contact] / 3 * 0.9
+        circos.rect(x_left, 0, x_right, bar_height, sector.index = host, track.index = 3, col = bar_color, border = NA)
+      }
+    }
+  }
+}
+
+circos.track(track.index = 4, panel.fun = function(x,y) {
+  sector.index = CELL_META$sector.index
+  circos.rect(CELL_META$xlim[1], CELL_META$ylim[1], CELL_META$xlim[2], CELL_META$ylim[2],
+              col = grid.col[sector.index], border = NA)
+}, bg.border = NA)
+
+circos.track(track.index = 5, panel.fun = function(x,y) {
+  sector.index = CELL_META$sector.index
+  if(sector.index %in% virus_nodes$name) {
+    circos.text(CELL_META$xcenter, CELL_META$ylim[1], sector.index, facing = "clockwise", niceFacing = TRUE,
+                adj = c(0,0.5), cex = 0.6, col = "#333333")
+  } else {
+    circos.text(CELL_META$xcenter, CELL_META$ylim[1], sector.index, facing = "clockwise", niceFacing = TRUE,
+                adj = c(0,0.5), cex = 0.7, col = "#333333", font = 3)
+  }
+}, bg.border = NA)
+
+legend_colors <- c("#9692B1","#C9A063","#BC3C29","#0072B5","#20854E")
+legend_labels <- c("Zoonotic virus","Animal pathogen virus","Rodent host","Lagomorph host","Eulipotyphla host","Other host")
+legend(x = -1.4, y = -1.0, legend = legend_labels, fill = legend_colors, border = "black", bty = "n", ncol = 2, cex = 0.75, title = "Legend", title.adj = 0)
+legend(x = 0.9, y = -1.0, legend = c("High (3)","Medium (2)","Low (1)"), fill = rep("#E0E0E0",3), border = "black", bty = "n", ncol = 1, cex = 0.7, title = "Human Contact Levels", title.adj = 0)
+
+dev.off()
